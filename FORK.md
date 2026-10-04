@@ -8,7 +8,7 @@ image: ghcr.io/batshalregmi/prefetcharr:latest
 ```
 
 The publishing workflow also creates a seven-character commit tag and supports
-`linux/amd64` and `linux/arm64`. Configuration, entrypoint and runtime layout
+`linux/amd64`. Configuration, entrypoint and runtime layout
 are unchanged.
 
 ## Behavior
