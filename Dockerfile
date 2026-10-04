@@ -4,7 +4,7 @@ RUN apk add libc-dev
 
 WORKDIR /app
 ADD . /app
-RUN cargo build --release
+RUN cargo build --release --locked
 
 
 FROM alpine:latest

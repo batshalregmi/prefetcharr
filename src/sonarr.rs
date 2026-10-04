@@ -239,30 +239,22 @@ impl Client {
         Ok(episodes)
     }
 
-    // Make sure all newly announced episodes will be monitored.
-    // https://forums.sonarr.tv/t/season-monitor-toggle-option-that-doesnt-change-the-existing-episode-state/30098/9
-    pub async fn monitor_unannounced_episodes(&self, series: &mut SeriesResource) -> Result<()> {
-        // Make series eligible for monitoring checks
+    // Only called for a future season. Preserve existing episode states while
+    // allowing Sonarr to monitor newly announced episodes in that season.
+    pub async fn monitor_future_season(
+        &self,
+        series: &mut SeriesResource,
+        season_num: i32,
+    ) -> Result<()> {
+        let season = series
+            .season(season_num)
+            .context("future season not found")?;
+        let original_episodes = self.episodes_season(series, season).await?;
         series.monitored = true;
-
-        // Monitor new seasons
-        series.monitor_new_items = Some(NewItemMonitorTypes::All);
-
-        // Monitor new episode announcements in last season
-        if let Some(last_season) = series.seasons.last_mut() {
-            last_season.monitored = true;
-        }
-
-        if let Some(last_season) = series.seasons.last() {
-            // Apply monitoring but restore episode state
-            let original_episodes = self.episodes_season(series, last_season).await?;
-            self.put_series(series).await?;
-            self.update_episode_monitoring(&original_episodes).await?;
-        } else {
-            // Apply monitoring
-            self.put_series(series).await?;
-        }
-
+        series.season_mut(season_num).unwrap().monitored = true;
+        info!(num = season_num, "Monitoring future season announcements");
+        self.put_series(series).await?;
+        self.update_episode_monitoring(&original_episodes).await?;
         Ok(())
     }
 

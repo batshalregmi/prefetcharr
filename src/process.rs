@@ -150,13 +150,15 @@ impl Actor {
             .await?;
 
         if episodes.len() < self.prefetch_num {
-            info!("Not as many episodes announced, monitor new items instead");
-            self.sonarr_client
-                .monitor_unannounced_episodes(&mut series)
-                .await?;
-        } else if !series.monitored {
-            series.monitored = true;
-            self.sonarr_client.put_series(&series).await?;
+            info!(
+                season = np.season,
+                "Insufficient announced episodes; skipping current-season monitoring and search to preserve Sonarr monitor state"
+            );
+            if series.season(np.season + 1).is_some() {
+                self.sonarr_client
+                    .monitor_future_season(&mut series, np.season + 1)
+                    .await?;
+            }
         }
 
         let missing_episodes: Vec<_> = episodes.into_iter().filter(|e| !e.has_file).collect();
@@ -164,6 +166,20 @@ impl Actor {
             .iter()
             .map(|e| EpisodeRef::new(e.season_number, e.episode_number))
             .collect();
+        // Keep the original window (and queue behavior) but only acquire future
+        // seasons. Filtering before taking the window would prefetch too early.
+        let missing_episodes: Vec<_> = missing_episodes
+            .into_iter()
+            .filter(|e| e.season_number > np.season)
+            .collect();
+        if missing_episodes.is_empty() {
+            return Ok(Some(pairs));
+        }
+        info!(season = np.season, "Evaluating future season prefetch");
+        if !series.monitored {
+            series.monitored = true;
+            self.sonarr_client.put_series(&series).await?;
+        }
         let mut episodes_to_search = Vec::new();
 
         if self.request_seasons {
@@ -397,6 +413,126 @@ mod test {
         actor_with_tag(fake, prefetch_num, request_seasons, None)
     }
 
+    #[tokio::test]
+    async fn preserve_current_season_monitor_state() -> anyhow::Result<()> {
+        for request_seasons in [false, true] {
+            for playback in [5, 11, 12] {
+                for has_file in [false, true] {
+                    for future_airing in [false, true] {
+                        let fake = FakeSonarr::start().await;
+                        let mut series = make_series(
+                            1234,
+                            "TestShow",
+                            5678,
+                            &[
+                                make_season(3, false, true),
+                                make_season(4, false, !future_airing),
+                            ],
+                        );
+                        series["monitorNewItems"] = json!("none");
+                        fake.add_series(series);
+                        let current: Vec<_> = (1..=12)
+                            .map(|e| {
+                                let mut ep = make_episode(300 + e, 1234, 3, e, has_file);
+                                ep["monitored"] = json!(e >= 11);
+                                ep
+                            })
+                            .collect();
+                        fake.add_episodes(current.clone());
+                        fake.add_episodes(vec![
+                            make_episode(401, 1234, 4, 1, false),
+                            make_episode(402, 1234, 4, 2, false),
+                        ]);
+                        let mut actor = actor(&fake, 2, request_seasons);
+                        let np = NowPlaying {
+                            series: Series::Tvdb(5678),
+                            season: 3,
+                            episode: playback,
+                            ..np_default()
+                        };
+                        actor.prefetch(np.clone()).await?;
+                        let commands = fake.commands();
+                        actor.prefetch(np).await?;
+                        assert_eq!(
+                            commands,
+                            fake.commands(),
+                            "duplicate playback must not search again"
+                        );
+                        for ep in current {
+                            assert_eq!(
+                                fake.episode(i32::try_from(ep["id"].as_i64().unwrap()).unwrap()),
+                                ep
+                            );
+                        }
+                        assert_eq!(
+                            fake.series_state(1234)["seasons"][0]["monitored"],
+                            json!(false)
+                        );
+                        assert_eq!(fake.series_state(1234)["monitorNewItems"], json!("none"));
+                        if playback == 5 {
+                            assert!(commands.is_empty());
+                        } else if request_seasons && !future_airing {
+                            assert_eq!(
+                                commands,
+                                vec![
+                                    json!({"name": "SeasonSearch", "seriesId": 1234, "seasonNumber": 4})
+                                ]
+                            );
+                        } else {
+                            let ids = if playback == 11 {
+                                vec![401]
+                            } else {
+                                vec![401, 402]
+                            };
+                            assert_eq!(
+                                commands,
+                                vec![json!({"name": "EpisodeSearch", "episodeIds": ids})]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn future_season_without_announced_episodes() -> anyhow::Result<()> {
+        let fake = FakeSonarr::start().await;
+        fake.add_series(default_series());
+        let episodes: Vec<_> = default_episodes()
+            .into_iter()
+            .filter(|e| e["seasonNumber"] == 1)
+            .collect();
+        fake.add_episodes(episodes.clone());
+        actor(&fake, 2, true)
+            .prefetch(NowPlaying {
+                series: Series::Tvdb(5678),
+                season: 1,
+                episode: 7,
+                ..np_default()
+            })
+            .await?;
+        assert!(fake.commands().is_empty());
+        assert!(
+            !fake.series_state(1234)["seasons"][1]["monitored"]
+                .as_bool()
+                .unwrap()
+        );
+        assert!(
+            fake.series_state(1234)["seasons"][2]["monitored"]
+                .as_bool()
+                .unwrap()
+        );
+        for ep in episodes {
+            assert_eq!(
+                fake.episode(i32::try_from(ep["id"].as_i64().unwrap()).unwrap()),
+                ep
+            );
+        }
+        Ok(())
+    }
+
     fn actor_with_tag(
         fake: &FakeSonarr,
         prefetch_num: usize,
@@ -418,7 +554,7 @@ mod test {
         )
     }
 
-    // Prefetching from mid-season triggers season searches for the current and next season
+    // The original window crosses into the next season; only that season is searched
     #[tokio::test]
     #[test_log::test]
     async fn search_next() -> Result<(), Box<dyn std::error::Error>> {
@@ -435,12 +571,14 @@ mod test {
             })
             .await?;
 
-        assert!(fake.series_state(1234)["monitored"].as_bool().unwrap());
         assert!(
-            fake.series_state(1234)["seasons"][1]["monitored"]
+            !fake.series_state(1234)["seasons"][1]["monitored"]
                 .as_bool()
                 .unwrap()
         );
+        for id in 11..=18 {
+            assert!(!fake.episode(id)["monitored"].as_bool().unwrap());
+        }
         assert!(
             fake.series_state(1234)["seasons"][2]["monitored"]
                 .as_bool()
@@ -448,10 +586,7 @@ mod test {
         );
         assert_eq!(
             fake.commands(),
-            vec![
-                json!({"name": "SeasonSearch", "seriesId": 1234, "seasonNumber": 1}),
-                json!({"name": "SeasonSearch", "seriesId": 1234, "seasonNumber": 2}),
-            ]
+            vec![json!({"name": "SeasonSearch", "seriesId": 1234, "seasonNumber": 2})]
         );
         Ok(())
     }
@@ -473,19 +608,17 @@ mod test {
             })
             .await?;
 
-        assert!(fake.series_state(1234)["monitored"].as_bool().unwrap());
-        assert!(fake.episode(18)["monitored"].as_bool().unwrap());
+        assert!(!fake.episode(18)["monitored"].as_bool().unwrap());
         assert!(fake.episode(21)["monitored"].as_bool().unwrap());
         assert!(fake.episode(22)["monitored"].as_bool().unwrap());
-        assert!(!fake.episode(11)["monitored"].as_bool().unwrap());
         assert_eq!(
             fake.commands(),
-            vec![json!({"name": "EpisodeSearch", "episodeIds": [18, 21, 22]}),]
+            vec![json!({"name": "EpisodeSearch", "episodeIds": [21, 22]})]
         );
         Ok(())
     }
 
-    // When fewer episodes remain than prefetch_num, monitors unannounced episodes and searches only what's available
+    // Final season shortage leaves monitoring unchanged and issues no search
     #[tokio::test]
     #[test_log::test]
     async fn search_episodes_exceeding() -> Result<(), Box<dyn std::error::Error>> {
@@ -502,24 +635,16 @@ mod test {
             })
             .await?;
 
-        // monitor_unannounced_episodes: series monitored, last season monitored
-        assert!(fake.series_state(1234)["monitored"].as_bool().unwrap());
-        assert!(
-            fake.series_state(1234)["seasons"][2]["monitored"]
-                .as_bool()
-                .unwrap()
-        );
-        // Episode monitoring restored: all s2 episodes back to unmonitored except the searched one
-        assert!(!fake.episode(21)["monitored"].as_bool().unwrap());
-        assert!(fake.episode(28)["monitored"].as_bool().unwrap());
-        assert_eq!(
-            fake.commands(),
-            vec![json!({"name": "EpisodeSearch", "episodeIds": [28]}),]
-        );
+        // No final-season fallback
+        assert_eq!(fake.series_state(1234), default_series());
+        for id in 21..=28 {
+            assert!(!fake.episode(id)["monitored"].as_bool().unwrap());
+        }
+        assert!(fake.commands().is_empty());
         Ok(())
     }
 
-    // Watching the pilot triggers unannounced episode monitoring since remaining episodes < prefetch_num
+    // Mid-season playback does not acquire current-season episodes
     #[tokio::test]
     #[test_log::test]
     async fn pilot() -> Result<(), Box<dyn std::error::Error>> {
@@ -536,17 +661,9 @@ mod test {
             })
             .await?;
 
-        // monitor_unannounced_episodes called (only 1 ep remaining in s1 < prefetch_num=2)
-        assert!(fake.series_state(1234)["monitored"].as_bool().unwrap());
-        assert!(
-            fake.series_state(1234)["seasons"][1]["monitored"]
-                .as_bool()
-                .unwrap()
-        );
-        assert_eq!(
-            fake.commands(),
-            vec![json!({"name": "SeasonSearch", "seriesId": 1234, "seasonNumber": 1}),]
-        );
+        // Current-season monitor state stays authoritative
+        assert_eq!(fake.series_state(1234), default_series());
+        assert!(fake.commands().is_empty());
         Ok(())
     }
 
@@ -571,7 +688,7 @@ mod test {
         Ok(())
     }
 
-    // When a season is already monitored, its episodes are explicitly monitored before searching
+    // An already-monitored current season still preserves unmonitored episodes
     #[tokio::test]
     #[test_log::test]
     async fn monitor_episodes_of_monitored_season() -> Result<(), Box<dyn std::error::Error>> {
@@ -590,22 +707,15 @@ mod test {
             })
             .await?;
 
-        // Season 1 was already monitored → episodes must be explicitly monitored
-        for e in 11..=18 {
-            assert!(
-                fake.episode(e)["monitored"].as_bool().unwrap(),
-                "s1e{} should be monitored",
-                e - 10
-            );
+        // Current-season episodes must remain unmonitored
+        for id in 11..=18 {
+            assert!(!fake.episode(id)["monitored"].as_bool().unwrap());
         }
-        assert_eq!(
-            fake.commands(),
-            vec![json!({"name": "SeasonSearch", "seriesId": 1234, "seasonNumber": 1}),]
-        );
+        assert!(fake.commands().is_empty());
         Ok(())
     }
 
-    // Seasons still airing fall back to episode search instead of season search
+    // Current-season airing episodes must not be searched
     #[tokio::test]
     #[test_log::test]
     async fn search_season_not_fully_aired() -> Result<(), Box<dyn std::error::Error>> {
@@ -625,12 +735,8 @@ mod test {
             })
             .await?;
 
-        assert!(fake.episode(18)["monitored"].as_bool().unwrap());
-        assert!(!fake.episode(17)["monitored"].as_bool().unwrap());
-        assert_eq!(
-            fake.commands(),
-            vec![json!({"name": "EpisodeSearch", "episodeIds": [18]}),]
-        );
+        assert!(!fake.episode(18)["monitored"].as_bool().unwrap());
+        assert!(fake.commands().is_empty());
         Ok(())
     }
 
@@ -655,19 +761,10 @@ mod test {
             .await?;
 
         // Season 2 fully aired → SeasonSearch
-        assert!(
-            fake.series_state(1234)["seasons"][2]["monitored"]
-                .as_bool()
-                .unwrap()
-        );
-        // Season 1 still airing → EpisodeSearch for s1e8
-        assert!(fake.episode(18)["monitored"].as_bool().unwrap());
+        assert!(!fake.episode(18)["monitored"].as_bool().unwrap());
         assert_eq!(
             fake.commands(),
-            vec![
-                json!({"name": "SeasonSearch", "seriesId": 1234, "seasonNumber": 2}),
-                json!({"name": "EpisodeSearch", "episodeIds": [18]}),
-            ]
+            vec![json!({"name": "SeasonSearch", "seriesId": 1234, "seasonNumber": 2})]
         );
         Ok(())
     }
@@ -709,7 +806,7 @@ mod test {
         actor_with_tag(&fake, 1, true, Some("no-prefetch".to_string()))
             .prefetch(NowPlaying {
                 series: Series::Title("TestShow".to_string()),
-                episode: 7,
+                episode: 8,
                 season: 1,
                 ..np_default()
             })
@@ -732,7 +829,7 @@ mod test {
         actor_with_tag(&fake, 1, true, Some("no-prefetch".to_string()))
             .prefetch(NowPlaying {
                 series: Series::Title("TestShow".to_string()),
-                episode: 7,
+                episode: 8,
                 season: 1,
                 ..np_default()
             })
@@ -752,7 +849,7 @@ mod test {
 
         let np = NowPlaying {
             series: Series::Title("TestShow".to_string()),
-            episode: 7,
+            episode: 8,
             season: 1,
             ..np_default()
         };
@@ -763,7 +860,7 @@ mod test {
 
         assert_eq!(
             fake.commands(),
-            vec![json!({"name": "SeasonSearch", "seriesId": 1234, "seasonNumber": 1})],
+            vec![json!({"name": "SeasonSearch", "seriesId": 1234, "seasonNumber": 2})],
         );
         Ok(())
     }
@@ -779,7 +876,7 @@ mod test {
         actor(&fake, 1, true)
             .prefetch(NowPlaying {
                 series: Series::Tvdb(5678),
-                episode: 7,
+                episode: 8,
                 season: 1,
                 ..np_default()
             })
